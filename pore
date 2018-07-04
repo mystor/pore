@@ -26,6 +26,7 @@ from pathlib import Path, PureWindowsPath
 import argparse
 import subprocess
 import shutil
+import signal
 import sys
 import os
 import re
@@ -57,9 +58,10 @@ when '--dump config' is passed.
   useful to avoid ssh negotiation overhead while syncing & injecting 
   commands.
 
-[pore.prefix.$REMOTE]   <default = "~/.pores">
+[pore.prefix.$REMOTE]   <default = ".pores">
   The prefix to add to remote paths when determining where the remote pore 
-  should be located. '~', '.', and '..' will be expanded remotely.
+  should be located. '~', '.', and '..' will not be expanded, but relative 
+  paths will be relative to the home directory.
 
   The remote-specific prefix will be checked before the global prefix.
 
@@ -67,7 +69,7 @@ when '--dump config' is passed.
   The prefix to remove from local paths when determining where the remote pore
   should be located. '~', '.', and '..' will be expanded locally.
 
-  For example, if 'pore.prefix' is "~/.pores", and 'pore.local-prefix' is 
+  For example, if 'pore.prefix' is ".pores", and 'pore.local-prefix' is 
   "/home/user", the path "/home/user/src/pore" would be synchronized to the
   folder "~/.pores/src/pore" on the remote.
 
@@ -155,7 +157,7 @@ class Config(object):
                              Use ~/.ssh/config to define complex remotes")
 
         prefix = Path(self.gitconfig('pore.prefix.' + self.remote, 
-                                     'pore.prefix', default='~/.pores'))
+                                     'pore.prefix', default='.pores'))
 
         # Read in 'pore.local-prefix' and resolve it to an absolute path,
         # expanding '~', '.' etc. relative to the checkout.
@@ -179,6 +181,7 @@ class Config(object):
         self.lsyncd_config_file = self.scratch_dir / 'lsyncd.config.lua'
         self.lsyncd_log_file = self.scratch_dir / 'lsyncd.log'
         self.lsyncd_pid_file = self.scratch_dir / 'lsyncd.pid'
+        self.rsync_lock_wrapper = self.scratch_dir / 'rsync_lock.sh'
 
         # Compute the pid of our lsyncd process, if one is running.
         self.lsyncd_pid = self.refresh_lsyncd_pid()
@@ -254,8 +257,7 @@ class SyncEngine(object):
             rule = '+ '
 
         # Unescape \!, \# and \\ at the beginning of the line
-        if line.startswith(('\\!', '\\', '\\#')):
-            line = line[1:]
+        line = line.replace('\\!', '!').replace('\\#', '#')
 
         # Attach a path prefix. If the pattern starts with a '/', we can anchor
         # it directly to the prefix. Otherwise, we need to add a '/**/' to
@@ -312,47 +314,44 @@ class SyncEngine(object):
 
     ## Build up the lsyncd config lua file
     def lsyncd_config(self):
-        filterlist = ',\n'.join([f'"{r}"' for r in self.filters])
+        filterlist = ',\n        '.join([f'"{r}"' for r in self.filters])
         return f'''
--- {self.config.lsyncd_config_file} --
-
-local function pore_sync ( filters )
-    settings {{
-        logfile = "{self.config.lsyncd_log_file}",
-        pidfile = "{self.config.lsyncd_pid_file}",
-    }}
-
-    sync {{
-        default.rsync,  -- TODO: Wrap ssh as well to use rsyncssh?
-
-        source = "{self.config.checkout}",
-        target = "{self.config.remote}:{self.config.remote_checkout}",
-
-        -- Wrap rsync with flock to prevent inject calls while syncing.
-        rsync = {{
-            binary = "{shutil.which('flock')}",
-            _extra = {{ 
-                "--shared", 
-                "{self.config.lsyncd_pid_file}", 
-                "{shutil.which('rsync')}" 
-            }}
-        }},
-
-        -- Only delete files which are deleted during the run.
-        -- Files deleted between syncs will not be removed to avoid deleting
-        -- generated files.
-        delete = 'running',
-
-        -- Turn down batching significantly to get a more live sync.
-        delay = 0.1,
-
-        filters = filters
-    }}
-end
-
-pore_sync {{
-{filterlist}
+settings {{
+    logfile = "{self.config.lsyncd_log_file}",
+    pidfile = "{self.config.lsyncd_pid_file}",
 }}
+
+sync {{
+    default.rsync,  -- TODO: Wrap ssh as well to use rsyncssh?
+
+    source = "{self.config.checkout}",
+    target = "{self.config.remote}:{self.config.remote_checkout}",
+
+    -- Wrap rsync with flock to prevent inject calls while syncing.
+    rsync = {{ binary = "{self.config.rsync_lock_wrapper}" }},
+
+    -- Only delete files which are deleted during the run.
+    -- Files deleted between syncs will not be removed to avoid deleting
+    -- generated files.
+    delete = 'running',
+
+    -- Turn down batching significantly to get a more live sync.
+    delay = 0.1,
+
+    -- Filters computed from .gitignore files
+    filter = {{
+        {filterlist}
+    }}
+}}
+'''
+
+
+def rsyncwrapper(config):
+    pidfile = shellquote(config.lsyncd_pid_file)
+    return f'''\
+#!/bin/sh
+# Make sure that we lock the pid file while doing the rsync to block inject.
+exec flock --shared {pidfile} rsync "$@"
 '''
 
 
@@ -361,7 +360,7 @@ def shellquote(*args):
     # everything, and replace every single quote with <'"'"'> (which ends the 
     # first string, concats a double quoted string containing a single quote, 
     # and then re-opens a single-quoted string).
-    return ' '.join("'" + s.replace("'", "'\"'\"'") + "'" for s in args)
+    return ' '.join(("'" + str(s).replace("'", "'\"'\"'") + "'") for s in args)
 
 
 def cmd_inject(args, config):
@@ -372,9 +371,17 @@ def cmd_inject(args, config):
     innercmd = shellquote(*args.inject) or '"$SHELL"'
     cmd = f'cd {config.remote_checkout} && exec {innercmd}'
 
+    # lock and unlock the pid file to wait for any pending syncs which have 
+    # a shared lock held.
+    flocked = subprocess.run(['flock', '-xn', config.lsyncd_pid_file, 'true'])
+    if flocked.returncode != 0:
+        print("Waiting for active sync to finish...", file=sys.stderr)
+        subprocess.run(['flock', '-x', config.lsyncd_pid_file, 'true'],
+                       check=True)
+
     # Start a login shell and run the command we computed inside it.
     # Use execlp to replace this process, as we're done
-    os.execlp('ssh', '-t', config.remote, '--', 
+    os.execlp('ssh', 'ssh', '-t', config.remote, '--', 
               f'exec "$SHELL" -lc {shellquote(cmd)}')
     raise PoreError("execlp failed to replace process")
 
@@ -388,16 +395,23 @@ def cmd_open(args, config):
     os.makedirs(config.scratch_dir, exist_ok=True)
     with open(config.lsyncd_config_file, 'w') as f:
         f.write(lsyncd_config)
+    with open(config.rsync_lock_wrapper, 'w') as f:
+        f.write(rsyncwrapper(config))
+
+    # Ensure that the directory exists on the remote machine.
+    subprocess.run(['ssh', config.remote, '--', 
+                    'mkdir', '-p', shellquote(config.remote_checkout)])
 
     # Start lsyncd in the background
-    subprocess.run(['lsyncd', config.lsyncd_config_file], check=True)
+    subprocess.run(['lsyncd', '-log', 'Exec', config.lsyncd_config_file],
+                   check=True)
 
 
 def cmd_close(args, config):
     if config.lsyncd_pid is None:
         raise PoreError("Pore not open")
 
-    os.kill(config.lsyncd_pid, signals.SIGTERM)
+    os.kill(config.lsyncd_pid, signal.SIGTERM)
     print(f'sent sigterm to pid {config.lsyncd_pid}', file=sys.stderr)
 
 
@@ -429,11 +443,19 @@ def cmd_dump_lsyncd_config(args, config):
     print(sync.lsyncd_config())
 
 
+def cmd_dump_lsyncd_log(args, config):
+    if sys.stdout.isatty():
+        os.execlp('less', 'less', '+F', config.lsyncd_log_file)
+    else:
+        os.execlp('cat', 'cat', config.lsyncd_log_file)
+
+
 DUMP_FLAGS = {
     'filters': cmd_dump_filters,
     'pid': cmd_dump_pid,
     'config': cmd_dump_config,
     'lsyncd-config': cmd_dump_lsyncd_config,
+    'lsyncd-log': cmd_dump_lsyncd_log,
 }
 
 
