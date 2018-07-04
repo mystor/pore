@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""
+A Pretty Okay Remote Environment
+
+pore [options]
+
+options:
+   -i, --inject [<cmd>...]  run <cmd> on the remote
+   -o, --open               open pore, if needed
+   --close                  close pore and exit
+   --dump=<what>            print pore status / config info and exit
+   --help                   show this help message and exit
+
+pore is a tool for remote software development. It is intended to enable
+local editing and version control, while using a remote machine for builds.
+
+Pores are associated with git repositories, using *git config* for configs.
+"""
+
+__author__ = 'Nika Layzell <nika@thelayzells.com>'
+__version__ = '0.1.0'
+__all__ = ['config', 'syncengine', 'known_limitations', 'valid_dump_flags']
+
+from pathlib import Path, PureWindowsPath
+
+import argparse
+import subprocess
+import shutil
+import sys
+import os
+import re
+
+# Documentation only methods
+def config(): 
+    '''\
+Pores are configured using 'git config'. The computed configuration is printed
+when '--dump config' is passed.
+
+[pore.remote]
+  The ssh host pore will connect to.
+
+  Use of '~/.ssh/config' for hosts is encouraged. It makes switching between
+  pore hosts easier, it customizing the username to connect with, and allows
+  configuring a ControlMaster for the connection. For example:
+
+    # ~/.ssh/config
+    Host hostname
+        HostName hostname.corp.com
+        User someuser
+
+        # Example ControlMaster Config
+        ControlPath ~/.ssh/controlmasters/%r@%h:%p
+        ControlMaster auto
+        ControlPersist 5m
+
+  ControlMaster, ControlPath, and ControlPerisist entries are especially 
+  useful to avoid ssh negotiation overhead while syncing & injecting 
+  commands.
+
+[pore.prefix.$REMOTE]   <default = "~/.pores">
+  The prefix to add to remote paths when determining where the remote pore 
+  should be located. '~', '.', and '..' will be expanded remotely.
+
+  The remote-specific prefix will be checked before the global prefix.
+
+[pore.local-prefix]     <default = "/">
+  The prefix to remove from local paths when determining where the remote pore
+  should be located. '~', '.', and '..' will be expanded locally.
+
+  For example, if 'pore.prefix' is "~/.pores", and 'pore.local-prefix' is 
+  "/home/user", the path "/home/user/src/pore" would be synchronized to the
+  folder "~/.pores/src/pore" on the remote.
+
+  To specify a specific directory for a particular repository, set 
+  'pore.prefix' to the desired target path, and set 'pore.local-prefix' to ".".
+'''
+
+def syncengine(): 
+    '''\
+[Ignored Files]
+  Only certain files are synchronized to the remote machine. Which files are sent
+  is determined by the ".gitignore" files in the pore's working directory at
+  startup. The ".git" directory itself will also be ignored.
+
+  lsyncd, the sync engine used by pore, uses a different filter syntax than git.
+  Pore will attempt to translate gitignore rules into lsyncd rules, but may
+  compute rules incorrectly.
+
+  The list of computed filters can be shown with '--dump filters'.
+
+[Deleting Files]
+  During the startup sync, remote files not found in the source directory will
+  not be deleted. This is to avoid clobbering any object directories or artifacts
+  which may only be present on the remote.
+
+  During normal operation, while the pore is open deleted files will also be
+  removed on the remote machine.
+
+[Remote Commands]
+  Remote Commands will be run on the remote within a login shell. They may be
+  interactive. If '-i' is passed without a command to run, an interactive
+  login shell session will be started.
+
+  If a pore is actively synchronizing changes to the remote, 'inject' will
+  block until the remote is up-to-date.
+'''
+
+def valid_dump_flags():
+    '''\
+--dump=pid              
+--dump=config           print computed pore configuration
+--dump=filters          print computed lsyncd filters
+--dump=lsyncd-config    print computed lsyncd configuration
+'''
+
+
+###################
+# Core pore logic #
+###################
+
+class PoreError(Exception):
+    pass
+
+
+class Config(object):
+    def __init__(self):
+        try:
+            cwd = Path.cwd()
+            self.checkout = next(p for p in [cwd, *cwd.parents]
+                                 if (p / '.git').exists())
+        except IndexError:
+            raise PoreError("Unable to locate git repository root")
+
+        self.gitdir = self.checkout / '.git'
+        if not self.gitdir.is_dir():
+            gitdir_lbl = 'gitdir:'
+            with open(self.gitdir) as f:
+                line = next(l for l in f if l.startswith(gitdir_lbl))
+            line = line[len(gitdir_lbl):].strip()
+
+            # Check if we're looking at a windows path, if we are, we must
+            # be in WSL, so convert the string assuming that.
+            winpath = PureWindowsPath(line)
+            if winpath.drive:
+                rel = winpath.relative_to(winpath.anchor).as_posix()
+                line = f'/mnt/{winpath.drive[:-1].lower()}/{rel}'
+
+            self.gitdir = Path(line)
+
+        self.remote = self.gitconfig('pore.remote')
+        if self.remote is None:
+            raise PoreError("No remote specified. Configure 'pore.remote' first")
+        if not re.fullmatch(r'[a-zA-Z0-9_]*', self.remote):
+            raise PoreError("'pore.remote' must be a simple ssh host.\n\
+                             Use ~/.ssh/config to define complex remotes")
+
+        prefix = Path(self.gitconfig('pore.prefix.' + self.remote, 
+                                     'pore.prefix', default='~/.pores'))
+
+        # Read in 'pore.local-prefix' and resolve it to an absolute path,
+        # expanding '~', '.' etc. relative to the checkout.
+        localprefix = Path(self.gitconfig('pore.local-prefix', default='/'))
+        self.local_prefix = self.checkout / localprefix.expanduser()
+
+        # Where is the checkout going to be located on the remote machine.
+        try:
+            self.remote_checkout = \
+                prefix / self.checkout.relative_to(self.local_prefix)
+        except ValueError:
+            raise PoreError("Checkout not relative to 'pore.local-prefix'")
+
+        # The equivalent path to cwd() on the remote.
+        self.remote_cwd = \
+            self.remote_checkout / Path.cwd().relative_to(self.checkout)
+
+        # Where helper files created by pore are located.
+        self.scratch_dir = self.gitdir / 'pore'
+
+        self.lsyncd_config_file = self.scratch_dir / 'lsyncd.config.lua'
+        self.lsyncd_log_file = self.scratch_dir / 'lsyncd.log'
+        self.lsyncd_pid_file = self.scratch_dir / 'lsyncd.pid'
+
+        # Compute the pid of our lsyncd process, if one is running.
+        self.lsyncd_pid = self.refresh_lsyncd_pid()
+
+    def gitconfig(self, *confs, default=None):
+        "read prioritized git config"
+        for conf in confs:
+            res = subprocess.run(['git', 'config', '--get', conf],
+                                 stdout=subprocess.PIPE, 
+                                 cwd=str(self.checkout))
+            if res.returncode == 0 and res.stdout:
+                return res.stdout.decode().strip()
+        return default
+
+    def refresh_lsyncd_pid(self):
+        try:
+            with open(self.lsyncd_pid_file) as f:
+                pid = int(f.read().strip())
+                os.kill(pid, 0)
+
+                self.lsyncd_pid = pid
+                return pid
+        except: # so many types of errors!
+            self.lsyncd_pid = None
+            return None
+
+
+class SyncEngine(object):
+    def __init__(self, config):
+        self.config = config
+
+        self.filters = ["- .git"]
+        self.read_filters_from_config()
+
+    ## Gitignore Handling
+    def read_filters_from_config(self):
+        # Read global gitignore (if configured).
+        globalignore = self.config.gitconfig('core.excludesFile')
+        if globalignore is not None:
+            self.read_ignorefile(globalignore)
+
+        # Read root gitignore if it exists (git ls-files won't see this one).
+        try:
+            self.read_ignorefile(self.config.checkout / '.gitignore')
+        except FileNotFoundError:
+            pass
+
+        # Read gitignore files in subdirectories.
+        filelist = subprocess.run(['git', 'ls-files', '*/.gitignore'], 
+                                  cwd=self.config.checkout, check=True,
+                                  stdout=subprocess.PIPE)
+        for path in filelist.stdout.decode().strip().splitlines():
+            self.read_ignorefile(self.config.checkout / path, 
+                                 prefix='/' + os.path.dirname(path))
+
+    def read_ignorefile(self, path, prefix=None):
+        with open(str(path)) as f:
+            for line in f:
+                self.filters += self.translate_ignore(line, prefix)
+
+    def translate_ignore(self, line, prefix=None):
+        # FIXME: Git allows trailing whitespace escaped with a backslash. 
+        line = line.rstrip()
+
+        # skip comments and empty lines.
+        if line.startswith('#') or line == '':
+            return []
+
+        # Check if ignore is negated.
+        rule = '- '
+        if line.startswith('!'):
+            line = line[1:]
+            rule = '+ '
+
+        # Unescape \!, \# and \\ at the beginning of the line
+        if line.startswith(('\\!', '\\', '\\#')):
+            line = line[1:]
+
+        # Attach a path prefix. If the pattern starts with a '/', we can anchor
+        # it directly to the prefix. Otherwise, we need to add a '/**/' to
+        # allow any set of directories between the prefix and the pattern.
+        if prefix is not None:
+            if line.startswith('/'):
+                line = prefix + line
+            elif line.startswith('**/'):
+                # avoid adding duplicate **/**/
+                line = prefix + '/' + line
+            else:
+                line = prefix + '/**/' + line
+
+        filters = [line]
+
+        # git treats '**/' as r'(.*/)?', while lsyncd treats it as r'.*/'.  We
+        # can emulate git's behaviour by creating an extra entry without each
+        # '**/'
+        def trans_pathglob(seg):
+            parts = seg.split('**/', maxsplit=1)
+            if len(parts) == 1:
+                return [seg]
+            return (parts[0] + sep + suffix 
+                    for suffix in trans_pathglob(parts[1])
+                    for sep in ('**/', ''))
+
+        filters = [n for o in filters for n in trans_pathglob(o)]
+
+        # lsyncd doesn't support [] groups. emulate by adding each char
+        # XXX: Upstream support for [] groups?
+        CHARGROUP_RE = re.compile(r'\[([^\]]+)\]')
+        CHARRANGE_RE = re.compile(r'(.)-(.)')
+        def trans_chargroup(seg):
+            match = CHARGROUP_RE.search(seg)
+            if match is None:
+                return [seg]
+
+            # Expand character ranges in the pattern
+            def expandrange(match):
+                ordinals = range(ord(match.group(1)), ord(match.group(2)) + 1)
+                return ''.join(map(chr, ordinals))
+            chars = CHARRANGE_RE.sub(expandrange, match.group(1))
+
+            # Join the text before and after the match around each character
+            start, end = match.span()
+            return (seg[:start] + c + suffix
+                    for suffix in trans_chargroup(seg[end:])
+                    for c in chars)
+
+        filters = [n for o in filters for n in trans_chargroup(o)]
+
+        # add a + or - rule and return
+        return [rule + filt for filt in filters]
+
+    ## Build up the lsyncd config lua file
+    def lsyncd_config(self):
+        filterlist = ',\n'.join([f'"{r}"' for r in self.filters])
+        return f'''
+-- {self.config.lsyncd_config_file} --
+
+local function pore_sync ( filters )
+    settings {{
+        logfile = "{self.config.lsyncd_log_file}",
+        pidfile = "{self.config.lsyncd_pid_file}",
+    }}
+
+    sync {{
+        default.rsync,  -- TODO: Wrap ssh as well to use rsyncssh?
+
+        source = "{self.config.checkout}",
+        target = "{self.config.remote}:{self.config.remote_checkout}",
+
+        -- Wrap rsync with flock to prevent inject calls while syncing.
+        rsync = {{
+            binary = "{shutil.which('flock')}",
+            _extra = {{ 
+                "--shared", 
+                "{self.config.lsyncd_pid_file}", 
+                "{shutil.which('rsync')}" 
+            }}
+        }},
+
+        -- Only delete files which are deleted during the run.
+        -- Files deleted between syncs will not be removed to avoid deleting
+        -- generated files.
+        delete = 'running',
+
+        -- Turn down batching significantly to get a more live sync.
+        delay = 0.1,
+
+        filters = filters
+    }}
+end
+
+pore_sync {{
+{filterlist}
+}}
+'''
+
+
+def shellquote(*args):
+    # Only reliable way to do bash escaping I know of is to single-quote 
+    # everything, and replace every single quote with <'"'"'> (which ends the 
+    # first string, concats a double quoted string containing a single quote, 
+    # and then re-opens a single-quoted string).
+    return ' '.join("'" + s.replace("'", "'\"'\"'") + "'" for s in args)
+
+
+def cmd_inject(args, config):
+    if config.lsyncd_pid is None:
+        raise PoreError("no pore open")
+
+    # Build up the command to run on the remote machine.
+    innercmd = shellquote(*args.inject) or '"$SHELL"'
+    cmd = f'cd {config.remote_checkout} && exec {innercmd}'
+
+    # Start a login shell and run the command we computed inside it.
+    # Use execlp to replace this process, as we're done
+    os.execlp('ssh', '-t', config.remote, '--', 
+              f'exec "$SHELL" -lc {shellquote(cmd)}')
+    raise PoreError("execlp failed to replace process")
+
+
+def cmd_open(args, config):
+    if config.lsyncd_pid is not None:
+        raise PoreError("Pore already open")
+
+    sync = SyncEngine(config)
+    lsyncd_config = sync.lsyncd_config()
+    os.makedirs(config.scratch_dir, exist_ok=True)
+    with open(config.lsyncd_config_file, 'w') as f:
+        f.write(lsyncd_config)
+
+    # Start lsyncd in the background
+    subprocess.run(['lsyncd', config.lsyncd_config_file], check=True)
+
+
+def cmd_close(args, config):
+    if config.lsyncd_pid is None:
+        raise PoreError("Pore not open")
+
+    os.kill(config.lsyncd_pid, signals.SIGTERM)
+    print(f'sent sigterm to pid {config.lsyncd_pid}', file=sys.stderr)
+
+
+def cmd_dump_filters(args, config):
+    engine = SyncEngine(config)
+    for filt in engine.filters:
+        print(filt)
+
+
+def cmd_dump_pid(args, config):
+    if config.lsyncd_pid is None:
+        sys.exit(1)
+    print(config.lsyncd_pid)
+
+
+def cmd_dump_config(args, config):
+    print(f'''\
+     lsyncd pid = {config.lsyncd_pid}
+ local checkout = {config.checkout}
+    remote host = {config.remote}
+remote checkout = {config.remote_checkout}
+     remote cwd = {config.remote_cwd}
+    scratch dir = {config.scratch_dir}
+''')
+
+
+def cmd_dump_lsyncd_config(args, config):
+    sync = SyncEngine(config)
+    print(sync.lsyncd_config())
+
+
+DUMP_FLAGS = {
+    'filters': cmd_dump_filters,
+    'pid': cmd_dump_pid,
+    'config': cmd_dump_config,
+    'lsyncd-config': cmd_dump_lsyncd_config,
+}
+
+
+def argparser():
+    # NOTE: We add our own help command here, which uses pydoc to display the 
+    # help. This makes it easier to display detailed help information.
+    parser = argparse.ArgumentParser(prog="pore", add_help=False)
+
+    # Actions
+    parser.add_argument('-i', '--inject', nargs='*', metavar='cmd')
+    parser.add_argument('-o', '--open', action='store_true')
+    parser.add_argument('--close', action='store_true')
+
+    # Other
+    parser.add_argument('--dump', choices=DUMP_FLAGS.keys())
+    parser.add_argument('--help', action='store_true')
+    parser.add_argument('--version', action='version', 
+                        version=f'pore {__version__}')
+    return parser
+
+
+def main():
+    parser = argparser()
+    args = parser.parse_args()
+    if args.help:
+        # Some trickery to document our module, while also using the name 
+        # 'pore', even though the module name is '__main__'
+        import pydoc
+        module = sys.modules['__main__']
+        globals()['__name__'] = 'pore'
+        pydoc.doc(module)
+        return
+
+    try:
+        config = Config()
+        if args.dump is not None:
+            DUMP_FLAGS[args.dump](args, config)
+            return
+
+        if args.close:
+            cmd_close(args, config)
+            return
+
+        if args.open:
+            if args.inject:
+                raise PoreError("'-oi' not supported yet")
+            cmd_open(args, config)
+            return
+
+        if args.inject is not None:
+            cmd_inject(args, config)
+            return
+
+        raise PoreError("no action provided")
+    except PoreError as e:
+        parser.print_usage(file=sys.stderr)
+        print(f'pore error: {str(e)}', file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+        main()
+
