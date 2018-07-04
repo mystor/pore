@@ -8,6 +8,7 @@ options:
    -i, --inject [<cmd>...]  run <cmd> on the remote
    -o, --open               open pore, if needed
    --close                  close pore and exit
+   --clean                  delete log and config files created by pore
    --dump=<what>            print pore status / config info and exit
    --help                   show this help message and exit
 
@@ -69,12 +70,24 @@ when '--dump config' is passed.
   The prefix to remove from local paths when determining where the remote pore
   should be located. '~', '.', and '..' will be expanded locally.
 
-  For example, if 'pore.prefix' is ".pores", and 'pore.local-prefix' is 
+  For example, if 'pore.prefix' is ".pores", and 'pore.local-prefix' is
   "/home/user", the path "/home/user/src/pore" would be synchronized to the
   folder "~/.pores/src/pore" on the remote.
 
-  To specify a specific directory for a particular repository, set 
+  To specify a specific directory for a particular repository, set
   'pore.prefix' to the desired target path, and set 'pore.local-prefix' to ".".
+
+[pore.gitignores]       <default = "global:root:subdirs">
+  A colon-separated list of the gitignore files to include when generating
+  lsyncd filters.
+
+  The special values 'global', 'root', and 'subdirs' represent the global
+  gitignore (core.excludesFile), the repository's root '.gitignore', and
+  '.gitignore' files found in subdirectories, respectively.
+
+  It may be necessary for large projects with many subdirectory .gitignore
+  files to remove the 'subdirs' entry, as lsyncd can choke on large numbers
+  of filters.
 '''
 
 def syncengine(): 
@@ -183,6 +196,10 @@ class Config(object):
         self.lsyncd_pid_file = self.scratch_dir / 'lsyncd.pid'
         self.rsync_lock_wrapper = self.scratch_dir / 'rsync_lock.sh'
 
+        # Read in gitignore configuration
+        self.ignorefiles = self.gitconfig(
+            'pore.gitignores', default='global:root:subdirs').split(':')
+
         # Compute the pid of our lsyncd process, if one is running.
         self.lsyncd_pid = self.refresh_lsyncd_pid()
 
@@ -190,7 +207,7 @@ class Config(object):
         "read prioritized git config"
         for conf in confs:
             res = subprocess.run(['git', 'config', '--get', conf],
-                                 stdout=subprocess.PIPE, 
+                                 stdout=subprocess.PIPE,
                                  cwd=str(self.checkout))
             if res.returncode == 0 and res.stdout:
                 return res.stdout.decode().strip()
@@ -218,27 +235,35 @@ class SyncEngine(object):
 
     ## Gitignore Handling
     def read_filters_from_config(self):
-        # Read global gitignore (if configured).
-        globalignore = self.config.gitconfig('core.excludesFile')
-        if globalignore is not None:
-            self.read_ignorefile(globalignore)
+        for ignfile in self.config.ignorefiles:
+            if ignfile == 'global':
+                # Read global gitignore (if configured).
+                globalignore = self.config.gitconfig('core.excludesFile')
+                if globalignore is not None:
+                    self.read_ignorefile(globalignore)
 
-        # Read root gitignore if it exists (git ls-files won't see this one).
-        try:
-            self.read_ignorefile(self.config.checkout / '.gitignore')
-        except FileNotFoundError:
-            pass
+            elif ignfile == 'root':
+                # Read root gitignore if it exists
+                try:
+                    self.read_ignorefile(self.config.checkout / '.gitignore')
+                except FileNotFoundError:
+                    pass
 
-        # Read gitignore files in subdirectories.
-        filelist = subprocess.run(['git', 'ls-files', '*/.gitignore'], 
-                                  cwd=self.config.checkout, check=True,
-                                  stdout=subprocess.PIPE)
-        for path in filelist.stdout.decode().strip().splitlines():
-            self.read_ignorefile(self.config.checkout / path, 
-                                 prefix='/' + os.path.dirname(path))
+            elif ignfile == 'subdirs':
+                # Read gitignore files in subdirectories.
+                filelist = subprocess.run(['git', 'ls-files', '*/.gitignore'],
+                                          cwd=self.config.checkout, check=True,
+                                          stdout=subprocess.PIPE)
+                for path in filelist.stdout.decode().strip().splitlines():
+                    self.read_ignorefile(self.config.checkout / path,
+                                         prefix='/' + os.path.dirname(path))
+
+            else:
+                # Literal pathname - just try to read it
+                self.read_ignorefile(ignfile)
 
     def read_ignorefile(self, path, prefix=None):
-        with open(str(path)) as f:
+        with open(path) as f:
             for line in f:
                 self.filters += self.translate_ignore(line, prefix)
 
@@ -363,6 +388,10 @@ def shellquote(*args):
     return ' '.join(("'" + str(s).replace("'", "'\"'\"'") + "'") for s in args)
 
 
+def open_rwx(path):
+    return open(os.open(path, os.O_CREAT | os.O_WRONLY, 0o755), 'w')
+
+
 def cmd_inject(args, config):
     if config.lsyncd_pid is None:
         raise PoreError("no pore open")
@@ -371,7 +400,7 @@ def cmd_inject(args, config):
     innercmd = shellquote(*args.inject) or '"$SHELL"'
     cmd = f'cd {config.remote_checkout} && exec {innercmd}'
 
-    # lock and unlock the pid file to wait for any pending syncs which have 
+    # lock and unlock the pid file to wait for any pending syncs which have
     # a shared lock held.
     flocked = subprocess.run(['flock', '-xn', config.lsyncd_pid_file, 'true'])
     if flocked.returncode != 0:
@@ -381,7 +410,7 @@ def cmd_inject(args, config):
 
     # Start a login shell and run the command we computed inside it.
     # Use execlp to replace this process, as we're done
-    os.execlp('ssh', 'ssh', '-t', config.remote, '--', 
+    os.execlp('ssh', 'ssh', '-t', config.remote, '--',
               f'exec "$SHELL" -lc {shellquote(cmd)}')
     raise PoreError("execlp failed to replace process")
 
@@ -395,7 +424,7 @@ def cmd_open(args, config):
     os.makedirs(config.scratch_dir, exist_ok=True)
     with open(config.lsyncd_config_file, 'w') as f:
         f.write(lsyncd_config)
-    with open(config.rsync_lock_wrapper, 'w') as f:
+    with open_rwx(config.rsync_lock_wrapper) as f:
         f.write(rsyncwrapper(config))
 
     # Ensure that the directory exists on the remote machine.
@@ -413,6 +442,13 @@ def cmd_close(args, config):
 
     os.kill(config.lsyncd_pid, signal.SIGTERM)
     print(f'sent sigterm to pid {config.lsyncd_pid}', file=sys.stderr)
+
+
+def cmd_clean(args, config):
+    if config.lsyncd_pid is not None:
+        raise PoreError("canknot clean while pore open")
+    shutil.rmtree(config.scratch_dir, ignore_errors=True)
+    print('deleted pore scratch directory', file=sys.stderr)
 
 
 def cmd_dump_filters(args, config):
@@ -472,6 +508,7 @@ def argparser():
     # Other
     parser.add_argument('--dump', choices=DUMP_FLAGS.keys())
     parser.add_argument('--help', action='store_true')
+    parser.add_argument('--clean', action='store_true')
     parser.add_argument('--version', action='version', 
                         version=f'pore {__version__}')
     return parser
@@ -489,11 +526,16 @@ def main():
         pydoc.doc(module)
         return
 
+    did_action = False
     try:
         config = Config()
         if args.dump is not None:
             DUMP_FLAGS[args.dump](args, config)
             return
+
+        if args.clean:
+            cmd_clean(args, config)
+            did_action = True
 
         if args.close:
             cmd_close(args, config)
@@ -509,7 +551,8 @@ def main():
             cmd_inject(args, config)
             return
 
-        raise PoreError("no action provided")
+        if not did_action:
+            raise PoreError("no action provided")
     except PoreError as e:
         parser.print_usage(file=sys.stderr)
         print(f'pore error: {str(e)}', file=sys.stderr)
