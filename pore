@@ -428,8 +428,9 @@ def cmd_open(args, config):
         f.write(rsyncwrapper(config))
 
     # Ensure that the directory exists on the remote machine.
-    subprocess.run(['ssh', config.remote, '--', 
-                    'mkdir', '-p', shellquote(config.remote_checkout)])
+    subprocess.run(['ssh', config.remote, '--',
+                    'mkdir', '-p', shellquote(config.remote_checkout)],
+                   check=True)
 
     # Start lsyncd in the background
     subprocess.run(['lsyncd', '-log', 'Exec', config.lsyncd_config_file],
