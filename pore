@@ -502,7 +502,7 @@ def argparser():
     parser = argparse.ArgumentParser(prog="pore", add_help=False)
 
     # Actions
-    parser.add_argument('-i', '--inject', nargs='*', metavar='cmd')
+    parser.add_argument('-i', '--inject', nargs=argparse.REMAINDER, metavar='cmd')
     parser.add_argument('-o', '--open', action='store_true')
     parser.add_argument('--close', action='store_true')
 
