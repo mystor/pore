@@ -217,13 +217,14 @@ class Config(object):
         try:
             with open(self.lsyncd_pid_file) as f:
                 pid = int(f.read().strip())
-                os.kill(pid, 0)
+            os.kill(pid, 0)
+        except PermissionError:
+            pass  # PID exists, but is owned by a different user
+        except (ProcessLookupError, FileNotFoundError, ValueError):
+            pid = None  # PIDFile missing, invalid or process dead.
 
-                self.lsyncd_pid = pid
-                return pid
-        except: # so many types of errors!
-            self.lsyncd_pid = None
-            return None
+        self.lsyncd_pid = pid
+        return pid
 
 
 class SyncEngine(object):
