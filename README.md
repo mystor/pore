@@ -12,7 +12,7 @@ Pore depends on some external programs which must also be installed and on your 
 1. [`lsyncd` 2.2.3+](https://github.com/axkibe/lsyncd)
 2. [`python` 3.6+](https://www.python.org/)
 3. [`git`](https://git-scm.com/)
-4. `ssh`, `sh`, and `flock` (which are probably already installed)
+4. `ssh` and `sh` (which are probably already installed)
 
 ## Usage
 ```

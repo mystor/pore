@@ -29,6 +29,7 @@ import subprocess
 import getpass
 import shutil
 import signal
+import fcntl
 import sys
 import os
 import re
@@ -95,7 +96,7 @@ when '--dump config' is passed.
   useful when the lsyncd program requires root access to observe filesystem
   changes, such as on macOS.
 
-[pore.bin.lsyncd|ssh|rsync|flock]
+[pore.bin.lsyncd|ssh|rsync]
   Custom executables to use instead of the given executable on your path. This
   can be used to specify a specific version of one of these executables than
   the one on $PATH.
@@ -221,8 +222,6 @@ class Config(object):
             self.gitconfig('pore.bin.rsync', default='rsync'))
         self.bin_ssh = shutil.which(
             self.gitconfig('pore.bin.ssh', default='ssh'))
-        self.bin_flock = shutil.which(
-            self.gitconfig('pore.bin.flock', default='flock'))
 
         # Program user overrides
         self.lsyncd_user = self.gitconfig('pore.sudo.lsyncd',
@@ -302,7 +301,7 @@ class SyncEngine(object):
                 self.filters += self.translate_ignore(line, prefix)
 
     def translate_ignore(self, line, prefix=None):
-        # FIXME: Git allows trailing whitespace escaped with a backslash. 
+        # FIXME: Git allows trailing whitespace escaped with a backslash.
         line = line.rstrip()
 
         # skip comments and empty lines.
@@ -386,7 +385,7 @@ sync {{
     source = "{self.config.checkout}",
     target = "{self.config.remote}:{self.config.remote_checkout}",
 
-    -- Wrap rsync with flock to prevent inject calls while syncing.
+    -- Wrap rsync to prevent inject calls while syncing.
     rsync = {{ binary = "{self.config.rsync_lock_wrapper}" }},
 
     -- Only delete files which are deleted during the run.
@@ -406,20 +405,27 @@ sync {{
 
 
 def rsyncwrapper(config):
-    pidfile = shellquote(config.lsyncd_pid_file)
-    flock = shellquote(config.bin_flock)
-    run_rsync = shellquote(*config.run_rsync)
     return f'''\
-#!/bin/sh
+#!{sys.executable}
+import sys
+import fcntl
+import subprocess
+
 # Make sure that we lock the pid file while doing the rsync to block inject.
-exec {flock} --shared {pidfile} {run_rsync} "$@"
+f = open({repr(str(config.lsyncd_pid_file))})
+try:
+    fcntl.flock(f, fcntl.LOCK_SH)
+    subprocess.check_call({repr(config.run_rsync)} + sys.argv[1:])
+finally:
+    fcntl.flock(f, fcntl.LOCK_UN)
+    f.close()
 '''
 
 
 def shellquote(*args):
-    # Only reliable way to do bash escaping I know of is to single-quote 
+    # Only reliable way to do bash escaping I know of is to single-quote
     # everything, and replace every single quote with <'"'"'> (which ends the
-    # first string, concats a double quoted string containing a single quote, 
+    # first string, concats a double quoted string containing a single quote,
     # and then re-opens a single-quoted string).
     return ' '.join(("'" + str(s).replace("'", "'\"'\"'") + "'") for s in args)
 
@@ -438,11 +444,14 @@ def cmd_inject(args, config):
 
     # lock and unlock the pid file to wait for any pending syncs which have
     # a shared lock held.
-    flocked = subprocess.run([config.bin_flock, '-xn', config.lsyncd_pid_file, 'true'])
-    if flocked.returncode != 0:
-        print("Waiting for active sync to finish...", file=sys.stderr)
-        subprocess.run([config.bin_flock, '-x', config.lsyncd_pid_file, 'true'],
-                       check=True)
+    with open(config.lsyncd_pid_file) as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Waiting for active sync to finish...", file=sys.stderr)
+            fcntl.flock(f, fcntl.LOCK_EX)
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
     # Start a login shell and run the command we computed inside it.
     # Use execlp to replace this process, as we're done
@@ -509,6 +518,8 @@ def cmd_dump_config(args, config):
 remote checkout = {config.remote_checkout}
      remote cwd = {config.remote_cwd}
     scratch dir = {config.scratch_dir}
+    lsyncd user = {config.lsyncd_user}
+       ssh user = {config.ssh_user}
 ''')
 
 
