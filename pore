@@ -26,6 +26,7 @@ from pathlib import Path, PureWindowsPath
 
 import argparse
 import subprocess
+import getpass
 import shutil
 import signal
 import sys
@@ -88,6 +89,16 @@ when '--dump config' is passed.
   It may be necessary for large projects with many subdirectory .gitignore
   files to remove the 'subdirs' entry, as lsyncd can choke on large numbers
   of filters.
+
+[pore.sudo.lsyncd|ssh]  <default = {current user}>
+  The user to switch to when running the lsyncd or ssh executables. This can be
+  useful when the lsyncd program requires root access to observe filesystem
+  changes, such as on macOS.
+
+[pore.bin.lsyncd|ssh|rsync|flock]
+  Custom executables to use instead of the given executable on your path. This
+  can be used to specify a specific version of one of these executables than
+  the one on $PATH.
 '''
 
 def syncengine(): 
@@ -202,6 +213,28 @@ class Config(object):
 
         # Compute the pid of our lsyncd process, if one is running.
         self.lsyncd_pid = self.refresh_lsyncd_pid()
+
+        # Binary name overrides
+        self.bin_lsyncd = shutil.which(
+            self.gitconfig('pore.bin.lsyncd', default='lsyncd'))
+        self.bin_rsync = shutil.which(
+            self.gitconfig('pore.bin.rsync', default='rsync'))
+        self.bin_ssh = shutil.which(
+            self.gitconfig('pore.bin.ssh', default='ssh'))
+        self.bin_flock = shutil.which(
+            self.gitconfig('pore.bin.flock', default='flock'))
+
+        # Program user overrides
+        self.lsyncd_user = self.gitconfig('pore.sudo.lsyncd',
+                                          default=getpass.getuser())
+        self.ssh_user = self.gitconfig('pore.sudo.ssh',
+                                       default=getpass.getuser())
+
+        # Computed command lines for specific programs
+        # XXX(nika): Is it worthwhile to avoid 'sudo' when possible?
+        self.run_lsyncd = ['sudo', '-u', self.lsyncd_user, self.bin_lsyncd]
+        self.run_ssh = ['sudo', '-u', self.ssh_user, self.bin_ssh]
+        self.run_rsync = ['sudo', '-u', self.ssh_user, self.bin_rsync]
 
     def gitconfig(self, *confs, default=None):
         "read prioritized git config"
@@ -374,16 +407,18 @@ sync {{
 
 def rsyncwrapper(config):
     pidfile = shellquote(config.lsyncd_pid_file)
+    flock = shellquote(config.bin_flock)
+    run_rsync = shellquote(*config.run_rsync)
     return f'''\
 #!/bin/sh
 # Make sure that we lock the pid file while doing the rsync to block inject.
-exec flock --shared {pidfile} rsync "$@"
+exec {flock} --shared {pidfile} {run_rsync} "$@"
 '''
 
 
 def shellquote(*args):
     # Only reliable way to do bash escaping I know of is to single-quote 
-    # everything, and replace every single quote with <'"'"'> (which ends the 
+    # everything, and replace every single quote with <'"'"'> (which ends the
     # first string, concats a double quoted string containing a single quote, 
     # and then re-opens a single-quoted string).
     return ' '.join(("'" + str(s).replace("'", "'\"'\"'") + "'") for s in args)
@@ -403,15 +438,15 @@ def cmd_inject(args, config):
 
     # lock and unlock the pid file to wait for any pending syncs which have
     # a shared lock held.
-    flocked = subprocess.run(['flock', '-xn', config.lsyncd_pid_file, 'true'])
+    flocked = subprocess.run([config.bin_flock, '-xn', config.lsyncd_pid_file, 'true'])
     if flocked.returncode != 0:
         print("Waiting for active sync to finish...", file=sys.stderr)
-        subprocess.run(['flock', '-x', config.lsyncd_pid_file, 'true'],
+        subprocess.run([config.bin_flock, '-x', config.lsyncd_pid_file, 'true'],
                        check=True)
 
     # Start a login shell and run the command we computed inside it.
     # Use execlp to replace this process, as we're done
-    os.execlp('ssh', 'ssh', '-t', config.remote, '--',
+    os.execlp(config.run_ssh[0], *config.run_ssh, '-t', config.remote, '--',
               f'exec "$SHELL" -lc {shellquote(cmd)}')
     raise PoreError("execlp failed to replace process")
 
@@ -429,21 +464,22 @@ def cmd_open(args, config):
         f.write(rsyncwrapper(config))
 
     # Ensure that the directory exists on the remote machine.
-    subprocess.run(['ssh', config.remote, '--',
+    subprocess.run([*config.run_ssh, config.remote, '--',
                     'mkdir', '-p', shellquote(config.remote_checkout)],
                    check=True)
 
-    # Start lsyncd in the background
-    subprocess.run(['lsyncd', '-log', 'Exec', config.lsyncd_config_file],
-                   check=True)
+    # Start lsyncd in the background. Only uses 'sudo'
+    subprocess.run([*config.run_lsyncd, '-log', 'Exec',
+                    config.lsyncd_config_file], check=True)
 
 
 def cmd_close(args, config):
     if config.lsyncd_pid is None:
         raise PoreError("Pore not open")
 
-    os.kill(config.lsyncd_pid, signal.SIGTERM)
-    print(f'sent sigterm to pid {config.lsyncd_pid}', file=sys.stderr)
+    os.execlp('sudo', 'sudo', '-u', config.lsyncd_user,
+              'kill', '--verbose', str(config.lsyncd_pid))
+    raise PoreError("execlp failed to replace process")
 
 
 def cmd_clean(args, config):
@@ -498,7 +534,7 @@ DUMP_FLAGS = {
 
 
 def argparser():
-    # NOTE: We add our own help command here, which uses pydoc to display the 
+    # NOTE: We add our own help command here, which uses pydoc to display the
     # help. This makes it easier to display detailed help information.
     parser = argparse.ArgumentParser(prog="pore", add_help=False)
 
