@@ -6,7 +6,7 @@ pore [options]
 
 options:
    -i, --inject [<cmd>...]  run <cmd> on the remote
-   -o, --open               open pore, if needed
+   -o, --open <remote>      open pore to the given remote
    --close                  close pore and exit
    --clean                  delete log and config files created by pore
    --dump=<what>            print pore status / config info and exit
@@ -35,35 +35,14 @@ import os
 import re
 
 # Documentation only methods
-def config(): 
+def config():
     '''\
 Pores are configured using 'git config'. The computed configuration is printed
 when '--dump config' is passed.
 
-[pore.remote]
-  The ssh host pore will connect to.
-
-  Use of '~/.ssh/config' for hosts is encouraged. It makes switching between
-  pore hosts easier, it customizing the username to connect with, and allows
-  configuring a ControlMaster for the connection. For example:
-
-    # ~/.ssh/config
-    Host hostname
-        HostName hostname.corp.com
-        User someuser
-
-        # Example ControlMaster Config
-        ControlPath ~/.ssh/controlmasters/%r@%h:%p
-        ControlMaster auto
-        ControlPersist 5m
-
-  ControlMaster, ControlPath, and ControlPerisist entries are especially 
-  useful to avoid ssh negotiation overhead while syncing & injecting 
-  commands.
-
 [pore.prefix.$REMOTE]   <default = ".pores">
-  The prefix to add to remote paths when determining where the remote pore 
-  should be located. '~', '.', and '..' will not be expanded, but relative 
+  The prefix to add to remote paths when determining where the remote pore
+  should be located. '~', '.', and '..' will not be expanded, but relative
   paths will be relative to the home directory.
 
   The remote-specific prefix will be checked before the global prefix.
@@ -102,8 +81,29 @@ when '--dump config' is passed.
   the one on $PATH.
 '''
 
-def syncengine(): 
+def syncengine():
     '''\
+[Remote Hosts]
+  The ssh host pore will connect to is specified when calling `pore -o`.
+
+  Use of '~/.ssh/config' for hosts is encouraged. It makes switching between
+  pore hosts easier, customizing the username to connect with, and allows
+  configuring a ControlMaster for the connection. For example:
+
+    # ~/.ssh/config
+    Host hostname
+        HostName hostname.corp.com
+        User someuser
+
+        # Example ControlMaster Config
+        ControlPath ~/.ssh/controlmasters/%r@%h:%p
+        ControlMaster auto
+        ControlPersist 5m
+
+  ControlMaster, ControlPath, and ControlPerisist entries are especially
+  useful to avoid ssh negotiation overhead while syncing & injecting
+  commands.
+
 [Ignored Files]
   Only certain files are synchronized to the remote machine. Which files are sent
   is determined by the ".gitignore" files in the pore's working directory at
@@ -134,7 +134,7 @@ def syncengine():
 
 def valid_dump_flags():
     '''\
---dump=pid              
+--dump=pid
 --dump=config           print computed pore configuration
 --dump=filters          print computed lsyncd filters
 --dump=lsyncd-config    print computed lsyncd configuration
@@ -150,7 +150,7 @@ class PoreError(Exception):
 
 
 class Config(object):
-    def __init__(self):
+    def __init__(self, args):
         try:
             cwd = Path.cwd()
             self.checkout = next(p for p in [cwd, *cwd.parents]
@@ -174,14 +174,37 @@ class Config(object):
 
             self.gitdir = Path(line)
 
-        self.remote = self.gitconfig('pore.remote')
-        if self.remote is None:
-            raise PoreError("No remote specified. Configure 'pore.remote' first")
-        if not re.fullmatch(r'[a-zA-Z0-9_]*', self.remote):
-            raise PoreError("'pore.remote' must be a simple ssh host.\n\
-                             Use ~/.ssh/config to define complex remotes")
+        # Where helper files created by pore are located.
+        self.scratch_dir = self.gitdir / 'pore'
 
-        prefix = Path(self.gitconfig('pore.prefix.' + self.remote, 
+        # Helper files created by phlay
+        self.lsyncd_config_file = self.scratch_dir / 'lsyncd.config.lua'
+        self.lsyncd_log_file = self.scratch_dir / 'lsyncd.log'
+        self.lsyncd_pid_file = self.scratch_dir / 'lsyncd.pid'
+        self.rsync_lock_wrapper = self.scratch_dir / 'rsync_lock.sh'
+
+        # Compute the pid of our lsyncd process, if one is running.
+        self.lsyncd_pid = self.refresh_lsyncd_pid()
+
+        # Determine the remote to use. If a parameter is specified to `-o`, use
+        # that remote, otherwise try to read it from the current prefix.
+        self.remote_file = self.scratch_dir / 'pore.remote'
+        if args.open:
+            self.remote = args.open
+        elif self.lsyncd_pid is not None:
+            try:
+                with open(self.remote_file) as f:
+                    self.remote = f.read().strip()
+            except FileNotFoundError:
+                self.remote = 'UNSET'
+        else:
+            self.remote = 'UNSET'
+
+        if not re.fullmatch(r'[a-zA-Z0-9_]*', self.remote):
+            raise PoreError("remote must be a simple ssh host.\n"
+                            "Use ~/.ssh/config to define complex remotes")
+
+        prefix = Path(self.gitconfig('pore.prefix.' + self.remote,
                                      'pore.prefix', default='.pores'))
 
         # Read in 'pore.local-prefix' and resolve it to an absolute path,
@@ -200,20 +223,9 @@ class Config(object):
         self.remote_cwd = \
             self.remote_checkout / Path.cwd().relative_to(self.checkout)
 
-        # Where helper files created by pore are located.
-        self.scratch_dir = self.gitdir / 'pore'
-
-        self.lsyncd_config_file = self.scratch_dir / 'lsyncd.config.lua'
-        self.lsyncd_log_file = self.scratch_dir / 'lsyncd.log'
-        self.lsyncd_pid_file = self.scratch_dir / 'lsyncd.pid'
-        self.rsync_lock_wrapper = self.scratch_dir / 'rsync_lock.sh'
-
         # Read in gitignore configuration
         self.ignorefiles = self.gitconfig(
             'pore.gitignores', default='global:root:subdirs').split(':')
-
-        # Compute the pid of our lsyncd process, if one is running.
-        self.lsyncd_pid = self.refresh_lsyncd_pid()
 
         # Binary name overrides
         self.bin_lsyncd = shutil.which(
@@ -260,8 +272,12 @@ class Config(object):
 
 
 class SyncEngine(object):
-    def __init__(self, config):
+    def __init__(self, config, remote=None):
         self.config = config
+
+        self.remote = config.remote
+        if remote is not None:
+            self.remote = remote
 
         self.filters = ["- .git"]
         self.read_filters_from_config()
@@ -338,7 +354,7 @@ class SyncEngine(object):
             parts = seg.split('**/', maxsplit=1)
             if len(parts) == 1:
                 return [seg]
-            return (parts[0] + sep + suffix 
+            return (parts[0] + sep + suffix
                     for suffix in trans_pathglob(parts[1])
                     for sep in ('**/', ''))
 
@@ -383,7 +399,7 @@ sync {{
     default.rsync,  -- TODO: Wrap ssh as well to use rsyncssh?
 
     source = "{self.config.checkout}",
-    target = "{self.config.remote}:{self.config.remote_checkout}",
+    target = "{self.remote}:{self.config.remote_checkout}",
 
     -- Wrap rsync to prevent inject calls while syncing.
     rsync = {{ binary = "{self.config.rsync_lock_wrapper}" }},
@@ -462,18 +478,22 @@ def cmd_inject(args, config):
 
 def cmd_open(args, config):
     if config.lsyncd_pid is not None:
-        raise PoreError("Pore already open")
+        # If a pore is open, close it.
+        print("Closing already open pore...", file=sys.stderr)
+        subprocess.run([sys.executable, __file__, '--close'], check=True)
 
-    sync = SyncEngine(config)
+    sync = SyncEngine(config, remote=args.open)
     lsyncd_config = sync.lsyncd_config()
     os.makedirs(config.scratch_dir, exist_ok=True)
     with open(config.lsyncd_config_file, 'w') as f:
         f.write(lsyncd_config)
+    with open(config.remote_file, 'w') as f:
+        f.write(args.open)
     with open_rwx(config.rsync_lock_wrapper) as f:
         f.write(rsyncwrapper(config))
 
     # Ensure that the directory exists on the remote machine.
-    subprocess.run([*config.run_ssh, config.remote, '--',
+    subprocess.run([*config.run_ssh, args.open, '--',
                     'mkdir', '-p', shellquote(config.remote_checkout)],
                    check=True)
 
@@ -487,7 +507,7 @@ def cmd_close(args, config):
         raise PoreError("Pore not open")
 
     os.execlp('sudo', 'sudo', '-u', config.lsyncd_user,
-              'kill', '--verbose', str(config.lsyncd_pid))
+              'kill', str(config.lsyncd_pid))
     raise PoreError("execlp failed to replace process")
 
 
@@ -551,14 +571,14 @@ def argparser():
 
     # Actions
     parser.add_argument('-i', '--inject', nargs=argparse.REMAINDER, metavar='cmd')
-    parser.add_argument('-o', '--open', action='store_true')
+    parser.add_argument('-o', '--open', metavar='remote')
     parser.add_argument('--close', action='store_true')
 
     # Other
     parser.add_argument('--dump', choices=DUMP_FLAGS.keys())
     parser.add_argument('--help', action='store_true')
     parser.add_argument('--clean', action='store_true')
-    parser.add_argument('--version', action='version', 
+    parser.add_argument('--version', action='version',
                         version=f'pore {__version__}')
     return parser
 
@@ -567,7 +587,7 @@ def main():
     parser = argparser()
     args = parser.parse_args()
     if args.help:
-        # Some trickery to document our module, while also using the name 
+        # Some trickery to document our module, while also using the name
         # 'pore', even though the module name is '__main__'
         import pydoc
         module = sys.modules['__main__']
@@ -577,7 +597,7 @@ def main():
 
     did_action = False
     try:
-        config = Config()
+        config = Config(args)
         if args.dump is not None:
             DUMP_FLAGS[args.dump](args, config)
             return
