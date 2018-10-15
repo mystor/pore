@@ -241,6 +241,10 @@ class Config(object):
         self.ssh_user = self.gitconfig('pore.sudo.ssh',
                                        default=getpass.getuser())
 
+        # Display envvar
+        self.display = self.gitconfig('pore.env.' + self.remote + '.DISPLAY',
+                                      default=':0')
+
         # Computed command lines for specific programs
         # XXX(nika): Is it worthwhile to avoid 'sudo' when possible?
         self.run_lsyncd = ['sudo', '-u', self.lsyncd_user, self.bin_lsyncd]
@@ -472,7 +476,7 @@ def cmd_inject(args, config):
     # Start a login shell and run the command we computed inside it.
     # Use execlp to replace this process, as we're done
     os.execlp(config.run_ssh[0], *config.run_ssh, '-t', config.remote, '--',
-              f'exec "$SHELL" -lc {shellquote(cmd)}')
+              f'exec env DISPLAY={shellquote(config.display)} "$SHELL" -lc {shellquote(cmd)}')
     raise PoreError("execlp failed to replace process")
 
 
@@ -481,6 +485,12 @@ def cmd_open(args, config):
         # If a pore is open, close it.
         print("Closing already open pore...", file=sys.stderr)
         subprocess.run([sys.executable, __file__, '--close'], check=True)
+
+    # Make sure to remove the PID file if present.
+    try:
+        os.remove(config.lsyncd_pid_file)
+    except FileNotFoundError:
+        pass
 
     sync = SyncEngine(config, remote=args.open)
     lsyncd_config = sync.lsyncd_config()
