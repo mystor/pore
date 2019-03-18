@@ -243,7 +243,7 @@ class Config(object):
 
         # Display envvar
         self.display = self.gitconfig('pore.env.' + self.remote + '.DISPLAY',
-                                      default=':0')
+                                      default=':1')
 
         # Computed command lines for specific programs
         # XXX(nika): Is it worthwhile to avoid 'sudo' when possible?
@@ -411,7 +411,7 @@ sync {{
     -- Only delete files which are deleted during the run.
     -- Files deleted between syncs will not be removed to avoid deleting
     -- generated files.
-    delete = 'running',
+    delete = true,
 
     -- Turn down batching significantly to get a more live sync.
     delay = 0.1,
@@ -482,8 +482,10 @@ def cmd_inject(args, config):
 
 def cmd_open(args, config):
     if config.lsyncd_pid is not None:
-        # If a pore is open, close it.
-        print("Closing already open pore...", file=sys.stderr)
+        if input(f'Restart running pore {config.lsyncd_pid}? [y/N] ').lower() != 'y':
+            return
+
+        print("NOTE: closing already open pore...", file=sys.stderr)
         subprocess.run([sys.executable, __file__, '--close'], check=True)
 
     # Make sure to remove the PID file if present.
@@ -499,6 +501,8 @@ def cmd_open(args, config):
         f.write(lsyncd_config)
     with open(config.remote_file, 'w') as f:
         f.write(args.open)
+    with open(config.lsyncd_log_file, 'w') as f:
+        pass # Truncate the file
     with open_rwx(config.rsync_lock_wrapper) as f:
         f.write(rsyncwrapper(config))
 
@@ -507,9 +511,24 @@ def cmd_open(args, config):
                     'mkdir', '-p', shellquote(config.remote_checkout)],
                    check=True)
 
+    # Tail the log until we find a "Startup finished" line.
+    tailProc = subprocess.Popen(['tail', '-f', config.lsyncd_log_file],
+                                stdout=subprocess.PIPE,
+                                universal_newlines=True)
+
     # Start lsyncd in the background. Only uses 'sudo'
-    subprocess.run([*config.run_lsyncd, '-log', 'Exec',
-                    config.lsyncd_config_file], check=True)
+    subprocess.run([*config.run_lsyncd, '-log', 'Normal',
+                    config.lsyncd_config_file], stdout=subprocess.DEVNULL, check=True)
+
+    while tailProc.poll() is None:
+        line = tailProc.stdout.readline()
+        if 'Normal:' in line:
+            _, info = line.split('Normal:', maxsplit=1)
+            print('lsyncd>> ' + info.strip() + '\033[K\r', file=sys.stderr)
+            if 'finished' in info:
+                break
+
+    tailProc.terminate()
 
 
 def cmd_close(args, config):
@@ -582,7 +601,7 @@ def argparser():
     # Actions
     parser.add_argument('-i', '--inject', nargs=argparse.REMAINDER, metavar='cmd')
     parser.add_argument('-o', '--open', metavar='remote')
-    parser.add_argument('--close', action='store_true')
+    parser.add_argument('-c', '--close', action='store_true')
 
     # Other
     parser.add_argument('--dump', choices=DUMP_FLAGS.keys())
@@ -621,10 +640,8 @@ def main():
             return
 
         if args.open:
-            if args.inject:
-                raise PoreError("'-oi' not supported yet")
             cmd_open(args, config)
-            return
+            did_action = True
 
         if args.inject is not None:
             cmd_inject(args, config)
