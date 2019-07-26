@@ -460,7 +460,7 @@ def cmd_inject(args, config):
 
     # Build up the command to run on the remote machine.
     innercmd = shellquote(*args.inject) or '"$SHELL"'
-    cmd = f'cd {config.remote_checkout} && exec {innercmd}'
+    cmd = f'cd {config.remote_cwd} && exec {innercmd}'
 
     # lock and unlock the pid file to wait for any pending syncs which have
     # a shared lock held.
